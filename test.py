@@ -4,8 +4,13 @@ Created on 14.08.2012
 @author: user
 '''
 import sys
-from poi import HSSFWorkbook, Workbook
+from poi import Workbook
 
+wb=Workbook('/home/user/workspace/Queck/mso/poi-3.8/test-data/spreadsheet/DateFormats.xls')
+print wb._workbook.urecord
+
+wb.write('test.xls')
+exit(0)
 
 def dump_sheet(ws):
     print '-----',ws.name.encode('latin1','replace'),'-----'
