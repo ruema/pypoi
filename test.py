@@ -6,27 +6,24 @@ Created on 14.08.2012
 import sys
 from poi import Workbook
 
-wb=Workbook('/home/user/workspace/Queck/mso/poi-3.8/test-data/spreadsheet/DateFormats.xls')
-print wb._workbook.urecord
-
-wb.write('test.xls')
-exit(0)
-
-def dump_sheet(ws):
-    print '-----',ws.name.encode('latin1','replace'),'-----'
-    for row_num in xrange(max(ws.rows)+1 if ws.rows else 0):
-        if row_num in ws.rows:
-            cells = ws.rows[row_num].cells
-            for col_num in xrange(max(cells)+1 if cells else 0):
-                if col_num in cells:
-                    val = cells[col_num].value
-                    if isinstance(val,basestring):
-                        print val.encode('latin1','replace'),
-                    else:
-                        print val
-                print ';',
+def dump_sheet(name,ws):
+    print '-----',name.encode('latin1','replace'),'-----'
+    for x in range(7):
+        for y in range(3):
+            print ws.cells(x,y).NumberFormat,ws.cells(x,y).Value,
+            ws.cells(x,y).Value=x+10*y
         print
 
+wb=Workbook('/home/user/workspace/Queck/mso/poi-3.8/test-data/spreadsheet/StringContinueRecords.xls')
+#wb=Workbook('test.xls')
+print wb.date1904
+for ws in wb.sheets:
+    dump_sheet(ws,wb.sheets[ws])
+wb.save('test.xls')
+wb=Workbook('test.xls')
+for ws in wb.sheets:
+    dump_sheet(ws,wb.sheets[ws])
+exit(0)
 
 wb=Workbook('/home/user/workspace/Queck/mso/poi-3.8/test-data/spreadsheet/DateFormats.xls')
 for ws in wb._workbook.sheets:
