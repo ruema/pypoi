@@ -1,5 +1,7 @@
 import weakref
 from poi.excel import HSSFWorkbook, HSSFWorksheet, boolean_property
+from poi.utils import BoundSheet
+from poi.formula import Formula
 
 def validate_worksheet_name(name):
     if not 0<len(name)<32:
@@ -30,6 +32,20 @@ class Range(object):
         cell=self._worksheet.get_cell(self._row, self._column)
         cell.set_value(value)
         
+    def get_formula(self):
+        try:
+            row=self._worksheet.rows[self._row]
+            cell=row.cells[self._column]
+            return cell.get_formula(self._worksheet)
+        except KeyError:
+            return None
+        
+    def set_formula(self,value):
+        formula=Formula.parse(value)
+        cell=self._worksheet.get_cell(self._row, self._column)
+        cell.set_formula(formula)
+        cell.set_value(formula.calc(self._worksheet))
+
     def get_numberformat(self):
         try:
             row=self._worksheet.rows[self._row]
@@ -40,6 +56,7 @@ class Range(object):
             return None
 
     Value=property(get_value,set_value)
+    Formula=property(get_formula,set_formula)
     NumberFormat=property(get_numberformat)
 
 __WORKSHEETS__=weakref.WeakKeyDictionary()
@@ -87,9 +104,11 @@ class Worksheets(object):
         except KeyError:
             pass
         validate_worksheet_name(name)
-        sheet = HSSFWorksheet(self.workbook._workbook, name)
-        self.workbook._workbook.sheets.append(sheet)
-        return sheet
+        bsh=BoundSheet()
+        bsh.sheetname=name
+        bsh.sheet = sheet = HSSFWorksheet(self.workbook._workbook)
+        self.workbook._workbook.sheets.append(bsh)
+        return Worksheet(sheet)
         
 
 class Workbook(object):

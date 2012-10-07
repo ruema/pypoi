@@ -6,10 +6,12 @@ Created on 16.09.2012
 from poi.poifs import CFBReader, CFBWriter
 from poi.utils import record_stream, Record, BoundSheet, RecordList,\
     FontRecord, NumberFormat, RowInfo, CellInfo, StaticStrings, MulCellInfo,\
-    ExtendedFormat, ColumnInfo, pack_short, pack_record
+    ExtendedFormat, ColumnInfo, pack_short, pack_record, NameRecord,\
+    SupBookRecord, SupBookSheet
 import poi.utils
 import struct
 import logging
+import re
 
 class RecordContainer(object):
     
@@ -84,6 +86,13 @@ std_format_strings = {
     0x31: "@",
     }
 
+NEWWORKBOOK=re.sub('[A-_]',lambda x:'0'*(ord(x.group(0))-63),
+    re.sub('\*','20'*109,'09081E605Ad310cc0741Me1B2AbA4c1B2Ee2E5cA7H*4'+
+    '2B2AbA4610102E3d01C9cB2BeA19B2E12B2E13B2Eaf0102Ebc0102E3dA12A680'+
+    '10e015c3abe2338J1A58024C2E8dB2E22B2FeB2B1Ab70102EdaB2E6A102E8cB4'+
+    'B1B1AfcB8QffB2B8BaE')).decode('hex')
+
+
 
 class HSSFWorkbook(RecordContainer):
     MAX_ROW = 0xFFFF
@@ -97,14 +106,17 @@ class HSSFWorkbook(RecordContainer):
     # See http://office.microsoft.com/en-us/excel-help/excel-specifications-and-limits-HP005199291.aspx
     MAX_STYLES = 4030
     
-    def __init__(self, filename=None):
+    def __init__(self, filename=None,content=NEWWORKBOOK):
+        self.streams={}
         self.sheets=RecordList(BoundSheet)
         self.fonts=RecordList(FontRecord)
         self.numberformats=RecordList(NumberFormat)
         self.extendedformats=RecordList(ExtendedFormat)
         self.staticstrings=StaticStrings()
-        if filename:
-            self.read(filename)
+        self.names=RecordList(NameRecord)
+        self.supbooks=RecordList(SupBookRecord)
+        if filename or content:
+            self.read(filename,content)
             
     def write(self, filename):
         cfb = CFBWriter()
@@ -114,9 +126,16 @@ class HSSFWorkbook(RecordContainer):
         cfb.write(filename)
         
     def getdata(self):
+        self.staticstrings.newstrings=[]
+        self.staticstrings.newstring_map={}
         for sheet in self.sheets:
             if sheet.sheet:
                 sheet.sheetdata=sheet.sheet.getdata()
+        self.staticstrings.strings=self.staticstrings.newstrings
+        del self.staticstrings.newstring_map
+
+        if 0x0085 not in self.urecord:
+            self.last_record.next=self.sheets
         result=[]
         first=self.records.next
         sheetpos=-1
@@ -138,26 +157,33 @@ class HSSFWorkbook(RecordContainer):
         return ''.join(result)
         
 
-    def read(self, filename):
-        filehandle=open(filename)
-        cfb = CFBReader(filehandle)
-        self.streams = cfb.dirtree
-        del cfb
+    def read(self, filename, content):
+        if filename:
+            filehandle=open(filename)
+            cfb = CFBReader(filehandle)
+            self.streams = cfb.dirtree
+            del cfb
 
-        # Normally, the Workbook will be in a POIFS Stream
-        # called "Workbook". However, some weird XLS generators use "WORKBOOK"
-        workbook=None
-        for wb in ('Book','BOOK','WORKBOOK','Workbook'):
-            if (wb,) in self.streams:
-                workbook = self.streams.pop((wb,))
-        if not workbook:
-            raise IOError('The file does not contain a Workbook-entry')
+            # Normally, the Workbook will be in a POIFS Stream
+            # called "Workbook". However, some XLS generators use "WORKBOOK"
+            workbook=None
+            for wb in ('Book','BOOK','WORKBOOK','Workbook'):
+                if (wb,) in self.streams:
+                    workbook = self.streams.pop((wb,))
+            if not workbook:
+                raise IOError('The file does not contain a Workbook-entry')
+            content=workbook.data
 
         loaders={
+            0x0018: self.names.add,
             0x0031: self.fonts.add,
+            0x0059: self.read_xct,
+            0x005A: self.read_crn,
             0x0085: self.sheets.add,
             0x00e0: self.extendedformats.add,
-            0x00fc: self.staticstrings.read,            
+            0x00fc: self.staticstrings.read,
+            0x00ff: Record.ignore,
+            0x01ae: self.supbooks.add,         
             0x041E: self.numberformats.add,
         }
 
@@ -165,7 +191,7 @@ class HSSFWorkbook(RecordContainer):
         self.records=Record(0,0)
         last_record=self.records
         ofs=0        
-        for sid, data in record_stream(workbook.data):
+        for sid, data in record_stream(content):
             if sid==0x000A: #EOF
                 break
             new_record=loaders.get(sid,Record)(sid,data)
@@ -174,21 +200,36 @@ class HSSFWorkbook(RecordContainer):
                 last_record=new_record
                 if sid not in urecord:
                     urecord[sid]=new_record
-            #if new_record.__class__==Record:
-            #    print '%04x(%08x): %s'%(sid,ofs,poi.utils.DEBUG_RECORDS.get(sid))
+            if new_record.__class__==Record:
+                print '%04x(%08x): %s'%(sid,ofs,poi.utils.DEBUG_RECORDS.get(sid))
             ofs+=len(data)
         self.urecord=urecord
         self.last_record=last_record
-        pos=len(workbook.data)
+        pos=len(content)
         for sheet in sorted(self.sheets,key=lambda s:s.position_of_BOF,reverse=True):
-            sheet.sheetdata=workbook.data[sheet.position_of_BOF:pos]
+            sheet.sheetdata=content[sheet.position_of_BOF:pos]
             pos=sheet.position_of_BOF
         self.numberformats_map=dict(std_format_strings)
         self.numberformats_map.update(dict([(nf.index,nf.format) for nf in self.numberformats]))
         
+    def read_xct(self, sid, data):
+        cnt, itab = struct.unpack_from('<hH',data+'\0\0',4)
+        supbook=self.supbooks[-1]
+        sheet=SupBookSheet(supbook.sheets[itab],cnt)
+        supbook.sheets[itab]=sheet
+        self.supbooksheet=sheet
+        
+    def read_crn(self, sid, data):
+        self.supbooksheet.append(data)
+        
+NEW_WORKSHEET=re.sub('[A-_]',lambda x:'0'*(ord(x.group(0))-63),
+    '09081E61Bd310cc0741NdB2B1BcB2A64BfB2B1A11B2E1C8Afca9f1d24d62503f'+
+    '5fB2B1A2aB2E2bB2E82B2B1A8C8Q250204EffA81B2B4c183B2E84B2E26B8Me83'+
+    'f27B8Me83f28B8Mf03f29B8Mf03fa1A22B1A64B1B1B1B2A2c012c01Ke03fKe03'+
+    'f01A55B2B8D20e]3e0212Ab606G4V1dB9TaE').decode('hex')
 
 class HSSFWorksheet(RecordContainer):
-    def __init__(self, parent, data, ofs):
+    def __init__(self, parent, data=NEW_WORKSHEET, ofs=0):
         self.columninfo=RecordList(ColumnInfo)
         self.parent=parent
         loaders={
@@ -220,8 +261,8 @@ class HSSFWorksheet(RecordContainer):
                 last_record=new_record
                 if sid not in urecord:
                     urecord[sid]=new_record
-            #if 1 or new_record.__class__==Record:
-            #    print '%04x(%08x): %s'%(sid,ofs,poi.utils.DEBUG_RECORDS.get(sid))
+            if new_record.__class__==Record:
+                print '%04x(%08x): %s'%(sid,ofs,poi.utils.DEBUG_RECORDS.get(sid))
             ofs+=len(data)
         self.urecord=urecord
 
@@ -274,9 +315,8 @@ class HSSFWorksheet(RecordContainer):
                 s_rows=[]
                 s_cells=[]
                 o_cells=[]
-                
-        print rows[0],rows[-1],first_col,last_col
-        return pack_short(0x0200,rows[0],rows[-1],first_col,last_col)+''.join(result)
+        if not rows: rows=[0];first_col=0        
+        return pack_record(0x0200,struct.pack('<iiHH',rows[0],rows[-1]+1,first_col,last_col+1))+''.join(result)
         
     def getdata(self):
         result=[]
@@ -301,13 +341,19 @@ class HSSFWorksheet(RecordContainer):
         self.rows[row.row_number]=row
         return None
     
+    def find_cell(self, row, col):
+        if row not in self.rows:
+            return None
+        if col not in self.rows[row].cells:
+            return None
+        return self.rows[row].cells[col]
+    
     def get_cell(self, row, col):
         if row not in self.rows:
             self.rows[row]=RowInfo()
         if col not in self.rows[row].cells:
             self.rows[row].cells[col]=CellInfo()
         return self.rows[row].cells[col]
-        
     
     def add_cell(self, sid, data):
         cell, row, col=CellInfo.read(sid,data)
@@ -346,4 +392,12 @@ class HSSFWorksheet(RecordContainer):
             self.lastcell._value = result
 
     def add_string(self, value):
-        return self.parent.staticstrings.string_map[value]
+        if not isinstance(value,tuple):
+            value=(value,(),'')
+        try:
+            return self.parent.staticstrings.newstring_map[value]
+        except KeyError:
+            r=len(self.parent.staticstrings.newstrings)
+            self.parent.staticstrings.newstring_map[value]=r
+            self.parent.staticstrings.newstrings.append(value)
+            return r

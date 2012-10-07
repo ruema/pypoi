@@ -5,15 +5,20 @@ Created on 16.09.2012
 '''
 import struct
 import logging
+from collections import namedtuple
+
+class ErrorCode(object):
+    def __init__(self, errcode):
+        self.errcode=errcode
 
 class StringUtils(object):
     @staticmethod
     def readUnicodeLEString(data,ofs,chars):
-        return data[ofs:ofs+2*chars].decode('utf-16le')
+        return data[ofs:ofs+2*chars].decode('utf-16le','replace')
     
     @staticmethod
     def readCompressedUnicode(data, ofs, chars):
-        return data[ofs:ofs+chars].decode('latin1')
+        return data[ofs:ofs+chars].decode('latin1','replace')
 
     @staticmethod
     def readString(data, ofs, length=None):
@@ -27,9 +32,9 @@ class StringUtils(object):
             is16bit = ord(data[ofs])
             add=1
         if is16bit:
-            return data[ofs+add:ofs+add+length*2].decode('utf-16le'),add+length*2
+            return data[ofs+add:ofs+add+length*2].decode('utf-16le','replace'),add+length*2
         else:
-            return data[ofs+add:ofs+add+length].decode('latin1'),add+length
+            return data[ofs+add:ofs+add+length].decode('latin1','replace'),add+length
 
     @staticmethod
     def readString8B(data, ofs):
@@ -80,16 +85,20 @@ class Record(object):
 class RecordList(list, Record):
     def __init__(self, cls):
         self.cls=cls
+        self.map={}
         
     def add(self, sid, data):
-        self.append(self.cls.read(data))
+        obj = self.cls.read(data)
+        self.map[obj]=len(self)
+        self.append(obj)
         return self if len(self)==1 else None
 
     @property
     def data(self):
         return ''.join(entry.getdata() for entry in self)
 
-class FontRecord(object):
+class FontRecord(namedtuple('FontRecord',('height','attributes','color_palette_index',
+    'bold_weight', 'super_sub_script', 'underline', 'family', 'charset','font_name'))):
     SS_NONE             = 0;
     SS_SUPER            = 1;
     SS_SUB              = 2;
@@ -120,11 +129,11 @@ class FontRecord(object):
 
     @classmethod
     def read(cls, data):
-        self = cls()
-        (self.height, self.attributes, self.color_palette_index, self.bold_weight, self.super_sub_script,
-         self.underline, self.family, self.charset, _) = struct.unpack_from('<5H4B',data,4)
-        self.font_name=StringUtils.readString8B(data, 18)[0]
-        return self
+        (height, attributes, color_palette_index, bold_weight, super_sub_script,
+         underline, family, charset, _) = struct.unpack_from('<5H4B',data,4)
+        font_name=StringUtils.readString8B(data, 18)[0]
+        return cls(height, attributes, color_palette_index, bold_weight, super_sub_script,
+         underline, family, charset,font_name)
     
     def getdata(self):
         fn = StringUtils.writeString8B(self.font_name)
@@ -134,7 +143,9 @@ class FontRecord(object):
 
 class BoundSheet(object):
     sheet=None
-    
+    hidden=0
+    position_of_BOF=0
+ 
     @classmethod
     def read(cls, data):
         """
@@ -165,7 +176,131 @@ class NumberFormat(object):
         name = StringUtils.writeString(self.format)
         return struct.pack('<3H',0x041e,2+len(name),self.index)+name
 
-class ExtendedFormat(object):
+class NameRecord(object):
+    @classmethod
+    def read(cls, data):
+        self=cls()
+        self.options,self.key,name_len,self.formula_len, r1, self.itab, r2 = struct.unpack_from('<HBBHHHi',data,4)
+        if r1!=0 or r2!=0:
+            logging.warning('r1=%d, r2=%d'%(r1,r2))
+        self.name, ln=StringUtils.readString(data, 18, length=name_len)
+        self.formula=data[ln+18:]
+        return self
+
+    def getdata(self):
+        wide, name = StringUtils.writeString0(self.name)
+        return pack_record(0x0018,struct.pack('<HBBHHHiB', self.options,self.key,len(self.name),
+            self.formula_len, 0, self.itab, 0,wide)+name+self.formula)
+
+class SupBookRecord(object):
+    @classmethod
+    def read(cls, data):
+        self=cls()
+        if len(data)==8:
+            # 5.38.2 'Internal References'
+            # 5.38.3 'Add-In Functions'
+            self.numsheets, self.tag = struct.unpack_from('<HH',data,4)
+            #print '%d/%x'%(self.numsheets,self.tag)
+        else:
+            self.tag=None
+            self.numsheets, = struct.unpack_from('<H',data,4)
+            # 5.38.1 External References
+            self.encoded_url, ln = StringUtils.readString(data, 6)
+            ofs=ln+6
+            self.sheets = []
+            for _ in xrange(self.numsheets):
+                name, ln = StringUtils.readString(data, ofs)
+                self.sheets.append(name)
+            #print self.encoded_url, self.sheetNames
+        return self
+
+    def getdata(self):
+        if self.tag:
+            return pack_short(0x01ae,self.numsheets,self.tag)
+        names=[]
+        crns=[]
+        for i,sh in enumerate(self.sheets):
+            if not isinstance(sh,basestring):
+                crns.append(sh.getdata(i))
+                sh=sh.name
+            names.append(StringUtils.writeString(sh))
+        return pack_record(0x01ae,struct.pack('<H', len(names))+
+                StringUtils.writeString(self.encoded_url)+''.join(names))+''.join(crns)
+
+def ConstantValueParser(data, ofs):
+    # note - these (non-combinable) enum values are sparse.
+    READERS = {
+        0: lambda: (None,8), # TYPE_EMPTY: 8 byte 'not used' field
+        1: lambda: (struct.unpack_from('<d',data,ofs)[0], 8), # TYPE_NUMBER
+        2: lambda: StringUtils.readString(data, ofs), # TYPE_STRING
+        4: lambda: (data[ofs]!='\0', 8), # TYPE_BOOLEAN
+       16: lambda: (ErrorCode(ord(data[ofs])),8), # TYPE_ERROR_CODE
+    }
+    grbit = ord(data[ofs])
+    ofs+=1
+    try:
+        val, ln = READERS[grbit]()
+    except KeyError:
+        logging.warning("Constant-Type %d unknown"%grbit)
+        val, ln = None,8
+    return val,ln+1
+
+def ConstantValueDump(val):
+    if val is None:
+        return '\0\0\0\0\0\0\0\0\0'
+    if isinstance(val,basestring):
+        return '\2'+StringUtils.writeString(val)
+    if val in (True,False):
+        return '\4'+('\1' if val else '\0')+'\0\0\0\0\0\0\0'
+    if isinstance(val,ErrorCode):
+        return '\x10'+chr(val.errcode)+'\0\0\0\0\0\0\0'
+    return '\1'+struct.pack('<d',float(val))
+    
+class SupBookSheet(object):
+    def __init__(self, name, valid):
+        self.name=name
+        self.valid=valid
+        self.rows={}
+        
+    def append(self, data):
+        last_col, first_col, row = struct.unpack_from('<BBH',data,4)
+        row=self.rows.setdefault(row,{})
+        ofs=8
+        while first_col<=last_col:
+            val, ln = ConstantValueParser(data, ofs)
+            ofs+=ln
+            row[first_col]=val
+            first_col+=1
+    
+
+    def pack(self, row, first_col, last_col, vals):
+        return pack_record(0x005a,struct.pack('<BBH',last_col,first_col, row)+
+            ''.join(map(ConstantValueDump,vals)))
+        
+    
+    def getdata(self, idx):
+        crns=[]
+        for r in sorted(self.rows):
+            row=self.rows[r]
+            firstcol=-1
+            col=-2
+            vals=None
+            for c in sorted(row):
+                if c!=col+1:
+                    if vals:
+                        crns.append(self.pack(r,firstcol,col,vals))
+                    vals=[]
+                    firstcol=c
+                vals.append(row[c])
+                col=c
+            if vals:
+                crns.append(self.pack(r,firstcol,col,vals))
+        return pack_short(0x0059,-len(crns) if self.valid<0 else len(crns),idx)+''.join(crns)
+        
+    
+class ExtendedFormat(namedtuple('ExtendedFormat', ('font_index', 'format_index', 'cell_options',
+        'alignment_options', 'indention_options', 'border_options', 'palette_options',
+        'adtl_palette_options', 'fill_palette_options'))):
     NULL = 0xfff0 # null constant
 
     # xf type
@@ -224,12 +359,7 @@ class ExtendedFormat(object):
     
     @classmethod
     def read(cls, data):
-        self=cls()
-        (self.font_index, self.format_index, self.cell_options,
-        self.alignment_options, self.indention_options,
-        self.border_options, self.palette_options,
-        self.adtl_palette_options, self.fill_palette_options) = struct.unpack_from('<7HIH',data,4)
-        return self
+        return cls(*struct.unpack_from('<7HIH',data,4))
     
     def getdata(self):
         return struct.pack('<9HIH',0x00E0,20,self.font_index, self.format_index, self.cell_options,
@@ -255,15 +385,18 @@ class ContinueWriter(object):
     
     def write_struct(self, format, *data): #@ReservedAssignment
         self.write(struct.pack(format,*data))
-        
+    
+    def next_cont(self):
+        self.data[self.header_pos]=struct.pack('<H',self.record_ofs-4)
+        self.data.append(self.CONTINUE)
+        self.data.append('\0\0')
+        self.total_ofs+=4
+        self.record_ofs=4
+        self.header_pos=len(self.data)-1
+
     def write(self, data):
         if self.record_ofs+len(data)>self.RECORD_SIZE:
-            self.data[self.header_pos]=struct.pack('<H',self.record_ofs-4)
-            self.data.append(self.CONTINUE)
-            self.data.append('\0\0')
-            self.total_ofs+=4
-            self.record_ofs=4
-            self.header_pos=len(self.data)-1
+            self.next_cont()
         self.data.append(data)
         self.record_ofs+=len(data)
         self.total_ofs+=len(data)
@@ -279,18 +412,22 @@ class ContinueWriter(object):
 
 class StaticStrings(Record):
     def __init__(self):
+        self.num_strings=0
+        self.strings=[]
         pass
     
     def read(self, sid, data):
         if sid=='0x00ff':
             return None
-        
         next_border,self.num_strings,unique_strings = struct.unpack_from('<Hii',data,2)
         next_border+=4
         strings=[]
         pos=12
         for _i in xrange(unique_strings):
-            assert pos+3<next_border
+            if pos==next_border:
+                pos+=4
+                next_border=pos+struct.unpack_from('<H',data,pos-2)[0]
+            assert pos+3<=next_border
             nchars, options = struct.unpack_from('<HB', data,pos)
             pos += 3
             if options & 0x08: # richtext
@@ -307,11 +444,11 @@ class StaticStrings(Record):
                 if options & 0x01:
                     # Uncompressed UTF-16
                     avail = min((next_border - pos) >> 1, charsleft)
-                    accstrg += unicode(data[pos:pos+2*avail], "utf_16_le")
+                    accstrg += data[pos:pos+2*avail].decode("utf-16le",'replace')
                     pos += 2*avail
                 else:
                     avail = min(next_border - pos, charsleft)
-                    accstrg += unicode(data[pos:pos+avail], 'latin_1')
+                    accstrg += data[pos:pos+avail].decode('latin1')
                     pos += avail
                 charsleft -= avail
                 if charsleft == 0:
@@ -339,7 +476,7 @@ class StaticStrings(Record):
                 pho=''
                 while 1:
                     avail = min(next_border - pos, phosz)
-                    phosz+=data[pos:pos+avail]
+                    pho +=data[pos:pos+avail]
                     pos += avail
                     phosz -= avail
                     if phosz==0:
@@ -350,10 +487,11 @@ class StaticStrings(Record):
                 pho=None
             strings.append((accstrg,runs,pho))
         self.strings=strings
-        self.string_map=dict([(s[0],i) for i,s in enumerate(self.strings)])
         return None
     
     def getdata(self,ofs):
+        if not self.strings:
+            return ''
         abs_rel_ofs=[]
         sst=ContinueWriter(0x00FC)
         sst.write(struct.pack('<ii',self.num_strings, len(self.strings)))
@@ -361,7 +499,6 @@ class StaticStrings(Record):
             if cnt&7==0:
                 abs_rel_ofs.append(ofs+sst.total_ofs)
                 abs_rel_ofs.append(sst.record_ofs)
-
             string, runs, pho = st
             wide, cstr=StringUtils.writeString0(string)
             options=1 if wide else 0
@@ -370,13 +507,15 @@ class StaticStrings(Record):
             if pho: options|=8;frm+='H';xx.append(len(pho))
             sst.write_struct(frm,len(string),options,*xx)
             ofs=0
-            while ofs<len(cstr):
-                if ofs>0:
-                    sst.write('\x01' if wide else '\0')
+            while True:
                 avail=sst.available
                 if wide: avail&=~1
                 sst.write(cstr[ofs:ofs+avail])
                 ofs+=avail
+                if ofs>=len(cstr):
+                    break
+                sst.next_cont()
+                sst.write('\x01' if wide else '\0')
             if runs:
                 cstr=struct.pack('<%dH'%len(runs),*runs)
                 ofs=0
@@ -395,7 +534,7 @@ class ColumnInfo(object):
 
     @classmethod
     def read(cls, data):
-        return cls(*struct.unpack_from('<6H',data,4))
+        return cls(*struct.unpack_from('<6H',data+'\0'*12,4))
 
     def getdata(self):
         return pack_short(0x007D,self.firstCol, self.lastCol, 
@@ -406,6 +545,7 @@ class RowInfo(Record):
         (self.row_number, self.firstCol, self.lastCol, 
          self.height, self.optimize, self.reserved, self.options,
          self.xf_index) = struct.unpack_from('<8H',data or '\0'*20,4)
+        if not data: self.height=20
         self.cells={}
     
     @property
@@ -437,10 +577,6 @@ def set_rkvalue(rk):
     if d2[:4]=='\0\0\0\0' and ord(d2[4])&3==0:
         return chr(ord(d1[4])|1)+d1[5:]
     return d1
-
-class ErrorCode(object):
-    def __init__(self, errcode):
-        self.errcode=errcode
 
 class CellInfo(Record):
     _NOTSET=["NOT SET"]
@@ -489,10 +625,28 @@ class CellInfo(Record):
             else:
                 raise AssertionError("Unknown cell type")
         return self._value
+        
+    def set_value(self, value):
+        self._value=value
+        self.formula=None
+        self.data=None
+
+    def get_formula(self, worksheet):
+        if self.formula:
+            if isinstance(self.formula,basestring):
+                from poi.formula import Formula
+                self.formula=Formula.read(self.formula,14)
+            return str(self.formula)
+        return None
     
+    def set_formula(self, formula):
+        self._value=None
+        self.formula=formula
+        self.data=None
+
     def getdata(self, worksheet, row, col):
         more=''
-        if self.data is not None and self.sid!=0x00fd:
+        if self.data is not None and self.sid!=0x00fd and not isinstance(self._value,basestring):
             data=self.data
         elif self.formula:
             self.sid=0x0006
@@ -531,11 +685,6 @@ class CellInfo(Record):
         else:
             raise AssertionError('%04x:%r'%(self.sid,self._value))
         return struct.pack('<5H',self.sid,len(data)+6,row,col,self.xf_index)+data+more
-        
-    def set_value(self, value):
-        self._value=value
-        self.formula=None
-        self.data=None
 
 class MulCellInfo(Record):
     @classmethod

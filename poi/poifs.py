@@ -1,6 +1,5 @@
 import struct
 import os
-import time
 import logging
 
 class PropertyEntry(object):
@@ -82,7 +81,7 @@ class CFBReader(object):
         if len(chain)!=num_minifat:
             logging.warning("corrupt minifat-chain %d/%d"%(len(chain),num_minifat))
         for sec in chain:
-            self._minifat+=list(struct.unpack_from('<%dI'%fatpersec,self.data,(sec+1)<<self._blocksize))
+            self._minifat+=list(struct.unpack_from('<%dI'%fatpersec,self.data,sec<<self._blocksize))
 
         # read properties
         proppersec=1<<(self._blocksize-7)
@@ -92,7 +91,7 @@ class CFBReader(object):
             print len(chain)*proppersec,propblocks
             raise IOError("corrupt property-chain")
         for sec in chain:
-            idx=(sec+1)<<self._blocksize
+            idx=sec<<self._blocksize
             for _ in xrange(proppersec):
                 self._properties.append(PropertyEntry.read(self.data,idx))
                 idx+=128
@@ -110,7 +109,7 @@ class CFBReader(object):
 
     def _fat_chain_iterator(self, index):
         while index<0xFFFFFFFE:
-            yield index
+            yield index+1
             index = self._fat[index]
 
     def _minifat_chain_iterator(self, index):
@@ -119,18 +118,14 @@ class CFBReader(object):
             index = self._minifat[index]
 
     def _get_stream(self, index):
-        result=[]
-        for sec in self._fat_chain_iterator(index):
-            idx=(sec+1)<<self._blocksize
-            result.append(self.data[idx:idx+(1<<self._blocksize)])
-        return ''.join(result)
+        bs=self._blocksize
+        return ''.join(self.data[sec<<bs:(sec+1)<<bs]
+            for sec in self._fat_chain_iterator(index))
 
     def _get_ministream(self, index):
-        result=[]
-        for sec in self._minifat_chain_iterator(index):
-            idx=sec<<self._miniblocksize
-            result.append(self._ministream[idx:idx+(1<<self._miniblocksize)])
-        return ''.join(result)
+        bs=self._miniblocksize
+        return ''.join(self._ministream[sec<<bs:(sec+1)<<bs]
+            for sec in self._minifat_chain_iterator(index))
 
     def _walk_dirs(self, index, parents=()):
         entry = self._properties[index]
@@ -148,11 +143,15 @@ class CFBWriter(object):
     
     def __init__(self, blocksize=9, miniblocksize=6):
         self._blocksize = blocksize
+        self._bitmask = (1<<blocksize)-1
         self._miniblocksize = miniblocksize
         self.minicutoff = 4096
         self.dirtree=PropertyEntry('Root Entry', None, '\x20\x08\x02\0\0\0\0\0\xc0\0\0\0\0\0\0F')
         self.dirtree.child={}
         
+    def _blocks(self, size):
+        return (size+self._bitmask)>>self._blocksize
+    
     def put(self, direntry, data, cid=''):
         new = None
         cur = self.dirtree
@@ -184,22 +183,19 @@ class CFBWriter(object):
     def write(self, filename):
         self.__makeproperties()
         self.__makesmallstream()
-        propblocks = (len(self.properties)*128+(1<<self._blocksize)-1)>>self._blocksize
-        self.totalblocks+= propblocks
+        difperblock=(1<<(self._blocksize-2))-1
+        propblocks = self._blocks(len(self.properties)*128)
+        blockcnt = self.totalblocks+propblocks
         while True:
             # fat sectors
-            fatsectors = (self.totalblocks*4+(1<<self._blocksize)-1)>>self._blocksize
+            fatsectors = self._blocks(blockcnt*4)
             # difat sectors
-            difatsectors = 0
-            rest = fatsectors-109
-            while rest>0:
-                rest -= (1<<(self._blocksize-2))-1
-                difatsectors += 1
-            self.totalblocks+=fatsectors + difatsectors
-            if fatsectors == (self.totalblocks*4+(1<<self._blocksize)-1)>>self._blocksize:
+            difatsectors = (fatsectors-109+difperblock-1)/difperblock
+            blockcnt = self.totalblocks+propblocks+fatsectors + difatsectors
+            if fatsectors == self._blocks(blockcnt*4):
                 break
         self.__makefat(difatsectors,fatsectors,self.sbatfatsize, propblocks, self.smallblocks)
-        self.properties[0].start = difatsectors+fatsectors+self.sbatfatsize+propblocks
+        self.properties[0].start = difatsectors+fatsectors+self.sbatfatsize+propblocks if self.SBATdata else -2
 
         # Write Header
         version=3 if self._blocksize==9 else 4
@@ -212,18 +208,19 @@ class CFBWriter(object):
             0,self.minicutoff,difatsectors+fatsectors if self.sbatfatsize else 0xfffffffe,
             self.sbatfatsize,0 if difatsectors else 0xfffffffe,difatsectors)
         
+        filehandle=open(filename,'wb')
         intsperblock=1<<(self._blocksize-2)
         df=range(difatsectors,difatsectors+fatsectors)+[0xffffffff]*intsperblock
         header+=struct.pack('<109I',*df[:109])
         if self._blocksize!=9:
             header+='\0\0\0\0'*(intsperblock-128)
-        filehandle=open(filename,'wb')
         filehandle.write(header)
         # Write DIFAT
         if difatsectors:
             ofs=109
             for cnt in xrange(difatsectors):
-                filehandle.write(struct.pack('<%sI'%intsperblock,*(df[ofs:ofs+intsperblock-1]+[cnt+1])))
+                filehandle.write(struct.pack('<%sI'%intsperblock,*(df[ofs:ofs+intsperblock-1]+[cnt+1 if cnt<difatsectors-1 else 0xfffffffe])))
+                ofs+=intsperblock-1
         # Write XBAT
         cnt = fatsectors * intsperblock
         if len(self.XBATdata)<cnt: self.XBATdata.extend([0xffffffff]*(cnt-len(self.XBATdata)))
@@ -243,7 +240,7 @@ class CFBWriter(object):
             filehandle.write(data)
             if len(data) & (blocksize-1):
                 filehandle.write('\0'*(blocksize-(len(data) & (blocksize-1))))
-        used = (sBATblocks*blocksize)&((1<<self._blocksize)-1)
+        used = (sBATblocks*blocksize)&self._bitmask
         if used:
             filehandle.write('\0'*((1<<self._blocksize)-used))
         # Write BigStream
@@ -268,12 +265,10 @@ class CFBWriter(object):
             
         self.XBATstreams=[]
         for entry in self.properties[1:]:
-            if entry.size<self.minicutoff:
-                pass
-            else:
+            if entry.size>=self.minicutoff:
                 entry.start = offset
                 self.XBATstreams.append(entry.data)
-                blocks=(entry.size+(1<<self._blocksize)-1)>>self._blocksize
+                blocks = self._blocks(entry.size)
                 offset = self.__appendXBAT(offset, blocks)
         
     @staticmethod
@@ -332,12 +327,12 @@ class CFBWriter(object):
                 self.SBATdata.append(0xFFFFFFFE)
                 sbatofs+=blocks
             else:
-                self.totalblocks+=(entry.size+(1<<self._blocksize)-1)>>self._blocksize
-        self.smallblocks = (sbatofs*(1<<self._miniblocksize)+(1<<self._blocksize)-1)>>self._blocksize
+                self.totalblocks+=self._blocks(entry.size)
+        self.smallblocks = self._blocks(sbatofs<<self._miniblocksize)
         self.totalblocks+= self.smallblocks
-        self.sbatfatsize = (len(self.SBATdata)*4+(1<<self._blocksize)-1)>>self._blocksize
+        self.sbatfatsize = self._blocks(len(self.SBATdata)*4)
         self.totalblocks+= self.sbatfatsize
-        self.properties[0].size = sbatofs*(1<<self._miniblocksize)
+        self.properties[0].size = sbatofs<<self._miniblocksize
         
         
 if False:
