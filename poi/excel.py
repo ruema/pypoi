@@ -6,9 +6,8 @@ Created on 16.09.2012
 from poi.poifs import CFBReader, CFBWriter
 from poi.utils import record_stream, Record, BoundSheet, RecordList,\
     FontRecord, NumberFormat, RowInfo, CellInfo, StaticStrings, MulCellInfo,\
-    ExtendedFormat, ColumnInfo, pack_short, pack_record, NameRecord,\
-    SupBookRecord, SupBookSheet
-import poi.utils
+    ExtendedFormat, ColumnInfo, pack_record, NameRecord,\
+    SupBookRecord, SupBookSheet, RecordListRW
 import struct
 import logging
 import re
@@ -87,11 +86,11 @@ std_format_strings = {
     }
 
 NEWWORKBOOK=re.sub('[A-_]',lambda x:'0'*(ord(x.group(0))-63),
-    re.sub('\*','20'*109,'09081E605Ad310cc0741Me1B2AbA4c1B2Ee2E5cA7H*4'+
-    '2B2AbA4610102E3d01C9cB2BeA19B2E12B2E13B2Eaf0102Ebc0102E3dA12A680'+
-    '10e015c3abe2338J1A58024C2E8dB2E22B2FeB2B1Ab70102EdaB2E6A102E8cB4'+
-    'B1B1AfcB8QffB2B8BaE')).decode('hex')
-
+    re.sub('\*','20'*109,'09081E605Ad310cc0741Me1B2AbA4c1B2Ee2E5cA7H*'+
+    '42B2AbA4610102E3d01C9cB2BeA19B2E12B2E13B2Eaf0102Ebc0102E3dA12A68'+
+    '010e015c3abe2338J1A58024C2E8dB2E22B2FeB2B1Ab70102EdaB2E31A15Ac8E'+
+    'ff1f9A1L5A417269616ceB14If5ff2Vc0206A102E8cB4B1B1AfcB8QffB2B8BaE'
+    )).decode('hex')
 
 
 class HSSFWorkbook(RecordContainer):
@@ -109,9 +108,9 @@ class HSSFWorkbook(RecordContainer):
     def __init__(self, filename=None,content=NEWWORKBOOK):
         self.streams={}
         self.sheets=RecordList(BoundSheet)
-        self.fonts=RecordList(FontRecord)
+        self.fonts=RecordListRW(FontRecord)
         self.numberformats=RecordList(NumberFormat)
-        self.extendedformats=RecordList(ExtendedFormat)
+        self.extendedformats=RecordListRW(ExtendedFormat)
         self.staticstrings=StaticStrings()
         self.names=RecordList(NameRecord)
         self.supbooks=RecordList(SupBookRecord)
@@ -142,10 +141,10 @@ class HSSFWorkbook(RecordContainer):
         while first:
             if sheetpos==-1 and first is self.sheets:
                 sheetpos=len(result)
-            result.append(first.data)
+            result.append(first.get_data(self))
             first=first.next
         reslen=sum(map(len,result))
-        result.append(self.staticstrings.getdata(reslen))
+        result.append(self.staticstrings.getdata(self,reslen))
         result.append(struct.pack('<HH',0x000A,0))  #EOF
         reslen+=len(result[-2])+4
         
@@ -153,7 +152,7 @@ class HSSFWorkbook(RecordContainer):
             sheet.position_of_BOF=reslen
             result.append(sheet.sheetdata)
             reslen+=len(sheet.sheetdata)
-        result[sheetpos]=self.sheets.data
+        result[sheetpos]=self.sheets.get_data(self)
         return ''.join(result)
         
 
@@ -175,16 +174,16 @@ class HSSFWorkbook(RecordContainer):
             content=workbook.data
 
         loaders={
-            0x0018: self.names.add,
-            0x0031: self.fonts.add,
+            0x0018: self.names.read,
+            0x0031: self.fonts.read,
             0x0059: self.read_xct,
             0x005A: self.read_crn,
-            0x0085: self.sheets.add,
-            0x00e0: self.extendedformats.add,
+            0x0085: self.sheets.read,
+            0x00e0: self.extendedformats.read,
             0x00fc: self.staticstrings.read,
             0x00ff: Record.ignore,
-            0x01ae: self.supbooks.add,         
-            0x041E: self.numberformats.add,
+            0x01ae: self.supbooks.read,         
+            0x041E: self.numberformats.read,
         }
 
         urecord={}
@@ -200,8 +199,8 @@ class HSSFWorkbook(RecordContainer):
                 last_record=new_record
                 if sid not in urecord:
                     urecord[sid]=new_record
-            if new_record.__class__==Record:
-                print '%04x(%08x): %s'%(sid,ofs,poi.utils.DEBUG_RECORDS.get(sid))
+            #if new_record.__class__==Record:
+            #    print '%04x(%08x): %s'%(sid,ofs,poi.utils.DEBUG_RECORDS.get(sid))
             ofs+=len(data)
         self.urecord=urecord
         self.last_record=last_record
@@ -221,6 +220,11 @@ class HSSFWorkbook(RecordContainer):
         
     def read_crn(self, sid, data):
         self.supbooksheet.append(data)
+
+    def add_extformat(self, xf):
+        if not hasattr(xf,'put_record'):
+            xf = self.extendedformats[xf]
+        return xf.put_record(self)
         
 NEW_WORKSHEET=re.sub('[A-_]',lambda x:'0'*(ord(x.group(0))-63),
     '09081E61Bd310cc0741NdB2B1BcB2A64BfB2B1A11B2E1C8Afca9f1d24d62503f'+
@@ -234,7 +238,7 @@ class HSSFWorksheet(RecordContainer):
         self.parent=parent
         loaders={
             0x0006: self.add_cell, # Formula
-            0x007d: self.columninfo.add,
+            0x007d: self.columninfo.read,
             0x00bd: self.add_mulcell, # MulRKRecord
             0x00be: self.add_mulcell, # MulBlankRecord
             0x00fd: self.add_cell, #LabelSSTRecord
@@ -261,8 +265,8 @@ class HSSFWorksheet(RecordContainer):
                 last_record=new_record
                 if sid not in urecord:
                     urecord[sid]=new_record
-            if new_record.__class__==Record:
-                print '%04x(%08x): %s'%(sid,ofs,poi.utils.DEBUG_RECORDS.get(sid))
+            #if new_record.__class__==Record:
+            #    print '%04x(%08x): %s'%(sid,ofs,poi.utils.DEBUG_RECORDS.get(sid))
             ofs+=len(data)
         self.urecord=urecord
 
@@ -304,7 +308,7 @@ class HSSFWorksheet(RecordContainer):
             row.row_number=crow
             s_cells.append(self.build_row(row))
             o_cells.append(len(s_cells[-1]))
-            s_rows.append(row.data)
+            s_rows.append(row.get_data(self))
             first_col=min(first_col,row.firstCol)
             last_col=max(last_col,row.lastCol)
             if len(s_rows)==32 or crow==rows[-1]:
@@ -325,7 +329,7 @@ class HSSFWorksheet(RecordContainer):
             if first is self.dimensions:
                 result.append(self.build_rows())
             else:
-                result.append(first.data)
+                result.append(first.get_data(self))
             first=first.next
         result.append(struct.pack('<HH',0x000A,0))  #EOF
         return ''.join(result)

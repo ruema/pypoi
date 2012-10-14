@@ -103,6 +103,8 @@ class ExpPtg(Ptg):
     def __str__(self):
         return "Exp"+str_ref(self._row,self._col)
 
+    def getdata(self):
+        return struct.pack('<BHH',0x01,self._row,self._col),None
 
 class TblPtg(Ptg):
     pass
@@ -130,84 +132,98 @@ class ValueOperatorPtg(Ptg):
         op2=_getvalue(worksheet, stack[-1])
         stack[-2:]=[self._calc(op1,op2)]
 
+    def getdata(self):
+        return chr(self.sid),None
     
 class AddPtg(ValueOperatorPtg):
+    sid=0x03
     op='+'
     
     def _calc(self, op1,op2):
         return op1+op2
 
 class SubtractPtg(ValueOperatorPtg):
+    sid=0x04
     op='-'
 
     def _calc(self, op1,op2):
         return op1-op2
 
 class MultiplyPtg(ValueOperatorPtg):
+    sid=0x05
     op='*'
 
     def _calc(self, op1,op2):
         return op1*op2
 
 class DividePtg(ValueOperatorPtg):
+    sid=0x06
     op='/'
 
     def _calc(self, op1,op2):
         return 1.0*op1/op2
 
 class PowerPtg(ValueOperatorPtg):
+    sid=0x07
     op='^'
 
     def _calc(self, op1,op2):
         return op1**op2
 
 class ConcatPtg(ValueOperatorPtg):
+    sid=0x08
     op='&'
 
     def _calc(self, op1,op2):
         return unicode(op1)+unicode(op2)
 
 class LessThanPtg(ValueOperatorPtg):
+    sid=0x09
     op='<'
 
     def _calc(self, op1,op2):
         return op1<op2
     
 class LessEqualPtg(ValueOperatorPtg):
+    sid=0x0A
     op='<='
 
     def _calc(self, op1,op2):
         return op1<=op2
 
 class EqualPtg(ValueOperatorPtg):
+    sid=0x0B
     op='='
 
     def _calc(self, op1,op2):
         return op1==op2
 
-class GreaterThanPtg(ValueOperatorPtg):
-    op='>'
-
-    def _calc(self, op1,op2):
-        return op1>op2
-
 class GreaterEqualPtg(ValueOperatorPtg):
+    sid=0x0C
     op='>='
 
     def _calc(self, op1,op2):
         return op1>=op2
 
+class GreaterThanPtg(ValueOperatorPtg):
+    sid=0x0D
+    op='>'
+
+    def _calc(self, op1,op2):
+        return op1>op2
+
 class NotEqualPtg(ValueOperatorPtg):
+    sid=0x0E
     op='<>'
 
     def _calc(self, op1,op2):
         return op1!=op2
 
-class UnionPtg(Ptg):
+class IntersectionPtg(Ptg):
     pass
 
 
-class IntersectionPtg(Ptg):
+class UnionPtg(Ptg):
     pass
 
 
@@ -216,6 +232,7 @@ class RangePtg(Ptg):
 
 
 class UnaryPlusPtg(ValueOperatorPtg):
+    sid=0x12
     op='+...'
 
     def mkstr(self, stack):
@@ -226,6 +243,7 @@ class UnaryPlusPtg(ValueOperatorPtg):
         stack[-1]=op1
 
 class UnaryMinusPtg(ValueOperatorPtg):
+    sid=0x13
     op='-...'
 
     def mkstr(self, stack):
@@ -236,6 +254,7 @@ class UnaryMinusPtg(ValueOperatorPtg):
         stack[-1]=-op1
 
 class PercentPtg(ValueOperatorPtg):
+    sid=0x14
     op='%'
 
     def mkstr(self, stack):
@@ -246,6 +265,7 @@ class PercentPtg(ValueOperatorPtg):
         stack[-1]=op1*0.01
 
 class ParenthesisPtg(ValueOperatorPtg):
+    sid=0x15
     op='(...)'
 
     def mkstr(self, stack):
@@ -272,6 +292,10 @@ class MissingArgPtg(Ptg):
     def getvalue(self, worksheet):
         return None
 
+    def getdata(self):
+        return '\x16',None
+    
+
 class ScalarConstantPtg(Ptg):
     def __init__(self, value):
         self.value=value
@@ -287,6 +311,9 @@ class StringPtg(ScalarConstantPtg):
     def read(cls, data, ofs, ofs2):
         val, ln = StringUtils.readString8B(data,ofs+1)
         return cls(val), ln+1,0
+
+    def getdata(self):
+        return '\x17'+StringUtils.writeString8B(self.value),None
 
 class AttrPtg(Ptg):
     # flags 'volatile' and 'space', can be combined.
@@ -366,24 +393,32 @@ class ErrPtg(ScalarConstantPtg):
     def read(cls, data, ofs, ofs2):
         return cls(ord(data[ofs+1])),2,0
 
+    def getdata(self):
+        return '\x1C'+ord(self.value),None
 
 class BoolPtg(ScalarConstantPtg):
     @classmethod
     def read(cls, data, ofs, ofs2):
         return cls(ord(data[ofs+1])!=0),2,0
 
+    def getdata(self):
+        return '\x1D\x01' if self.value else '\x1D\0',None
 
 class IntPtg(ScalarConstantPtg):
     @classmethod
     def read(cls, data, ofs, ofs2):
         return cls(struct.unpack_from('<H',data,ofs+1)[0]),3,0
 
+    def getdata(self):
+        return struct.pack('<BH',0x1E,self.value),None
 
 class NumberPtg(ScalarConstantPtg):
     @classmethod
     def read(cls, data, ofs, ofs2):
         return cls(struct.unpack_from('<d',data,ofs+1)[0]),9,0
 
+    def getdata(self):
+        return struct.pack('<Bd',0x1F,self.value),None
 
 class ArrayPtg(Ptg):
     pass
@@ -420,6 +455,9 @@ class FuncPtg(Ptg):
         params=[_getvalue(worksheet,p) if t=='V' else _getref(worksheet, p) for t,p in zip(func.paramClasses,params)]
         stack.append(func(*params))
 
+    def getdata(self):
+        return struct.pack('<BH',0x21+self.ptgClass,self.func_num),None
+
 class FuncVarPtg(Ptg):
     def __init__(self, num_args, func_num):
         self.num_args=num_args
@@ -452,6 +490,9 @@ class FuncVarPtg(Ptg):
         params=[_getvalue(worksheet,p) if t=='V' else _getref(worksheet, p) for t,p in zip(func.paramClasses+func.paramClasses[-1]*len(params),params)]
         stack.append(func(*params))
 
+    def getdata(self):
+        return struct.pack('<BBH',0x22+self.ptgClass,self.num_args,self.func_num),None
+
 
 class NamePtg(Ptg):
     @classmethod
@@ -480,6 +521,9 @@ class RefPtg(RefPtgBase):
     def getvalue(self, worksheet):
         cell=worksheet.find_cell(self._row,self._col&0x3fff)
         if cell: return cell.get_value(worksheet)
+
+    def getdata(self):
+        return struct.pack('<BHH',0x24+self.ptgClass,self._row,self._col),None
 
 
 class MemAreaPtg(Ptg):
@@ -763,6 +807,19 @@ class Formula(object):
         self.ptgs=ptgs
         return self
 
+    def getdata(self):
+        result=[]
+        add=[]
+        for ptg in self.ptgs:
+            data,more = ptg.getdata()
+            result.append(data)
+            if more: add.append(more)
+        result=''.join(result)
+        add=''.join(add)
+        return struct.pack('<H',len(result))+result+add
+            
+        
+        
     def __str__(self):
         stack=[]
         for ptg in self.ptgs:
@@ -775,7 +832,7 @@ class Formula(object):
         for ptg in self.ptgs:
             ptg.calc(worksheet,stack)
         if len(stack)>1: print '!!!!',stack[1:]
-        return stack[0]
+        return _getvalue(worksheet,stack[0])
 
     BASE_PTG= [
         UnknownPtg,

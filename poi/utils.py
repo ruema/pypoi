@@ -81,21 +81,62 @@ class Record(object):
     @staticmethod
     def ignore(sid, data):
         return None
+    
+    def get_data(self, parent):
+        return self.data
+
+class RecordListRW(list, Record):
+    def __init__(self, cls):
+        self.cls=cls
+        self.map={}
+        self.output_list=[]
+        self.output_map={}
+        
+    def read(self, sid, data):
+        return self._add(self.cls.read(data))==0 and self or None
+
+    def _add(self, obj):
+        self.map[obj]=idx=len(self)
+        self.append(obj)
+        return idx
+
+    def add(self, obj):
+        idx=self.map.get(obj)
+        if idx is None:
+            self.map[obj]=idx=len(self)
+            self.append(obj)
+        return idx
+
+    def add_out(self, obj):
+        if not isinstance(obj,self.cls):
+            obj=self[obj]
+        idx=self.output_map.get(obj)
+        if idx is None:
+            self.output_map[obj]=idx=len(self.output_list)
+            self.output_list.append(obj)
+        return idx
+    
+    def get_data(self, parent):
+        result=''.join(entry.getdata(parent) for entry in self.output_list)
+        self.output_list=[]
+        self.output_map={}
+        return result
 
 class RecordList(list, Record):
     def __init__(self, cls):
         self.cls=cls
         self.map={}
         
-    def add(self, sid, data):
-        obj = self.cls.read(data)
+    def read(self, sid, data):
+        return self.add(self.cls.read(data))==0 and self or None
+
+    def add(self, obj):
         self.map[obj]=len(self)
         self.append(obj)
-        return self if len(self)==1 else None
+        return len(self)-1
 
-    @property
-    def data(self):
-        return ''.join(entry.getdata() for entry in self)
+    def get_data(self, parent):
+        return ''.join(entry.getdata(parent) for entry in self)
 
 class FontRecord(namedtuple('FontRecord',('height','attributes','color_palette_index',
     'bold_weight', 'super_sub_script', 'underline', 'family', 'charset','font_name'))):
@@ -135,7 +176,7 @@ class FontRecord(namedtuple('FontRecord',('height','attributes','color_palette_i
         return cls(height, attributes, color_palette_index, bold_weight, super_sub_script,
          underline, family, charset,font_name)
     
-    def getdata(self):
+    def getdata(self, parent):
         fn = StringUtils.writeString8B(self.font_name)
         return struct.pack('<7H4B',0x0031,14+len(fn),self.height, self.attributes, 
             self.color_palette_index, self.bold_weight, self.super_sub_script,
@@ -160,19 +201,18 @@ class BoundSheet(object):
         self.sheetname = StringUtils.readString8B(data,10)[0]
         return self
 
-    def getdata(self):
+    def getdata(self, parent):
         name = StringUtils.writeString8B(self.sheetname)
         return struct.pack('<HHIH',0x0085,6+len(name),self.position_of_BOF,self.hidden)+name
             
-class NumberFormat(object):
+class NumberFormat(namedtuple('NumberFormat',('index','format'))):
     @classmethod
     def read(cls, data):
-        self=cls()
-        self.index = struct.unpack_from('<H',data,4)[0]
-        self.format=StringUtils.readString(data, 6)[0]
-        return self
+        index = struct.unpack_from('<H',data,4)[0]
+        formatstr=StringUtils.readString(data, 6)[0]
+        return cls(index,formatstr)
 
-    def getdata(self):
+    def getdata(self, parent):
         name = StringUtils.writeString(self.format)
         return struct.pack('<3H',0x041e,2+len(name),self.index)+name
 
@@ -187,7 +227,7 @@ class NameRecord(object):
         self.formula=data[ln+18:]
         return self
 
-    def getdata(self):
+    def getdata(self, parent):
         wide, name = StringUtils.writeString0(self.name)
         return pack_record(0x0018,struct.pack('<HBBHHHiB', self.options,self.key,len(self.name),
             self.formula_len, 0, self.itab, 0,wide)+name+self.formula)
@@ -214,7 +254,7 @@ class SupBookRecord(object):
             #print self.encoded_url, self.sheetNames
         return self
 
-    def getdata(self):
+    def getdata(self, parent):
         if self.tag:
             return pack_short(0x01ae,self.numsheets,self.tag)
         names=[]
@@ -361,11 +401,19 @@ class ExtendedFormat(namedtuple('ExtendedFormat', ('font_index', 'format_index',
     def read(cls, data):
         return cls(*struct.unpack_from('<7HIH',data,4))
     
-    def getdata(self):
+    def getdata(self, parent):
         return struct.pack('<9HIH',0x00E0,20,self.font_index, self.format_index, self.cell_options,
             self.alignment_options, self.indention_options,
             self.border_options, self.palette_options,
             self.adtl_palette_options, self.fill_palette_options)
+        
+    def put_record(self, parent):
+        while not hasattr(parent,'extendedformats'):
+            parent=parent.parent
+        rec=self._replace(
+            font_index=parent.fonts.add_out(self.font_index),
+        )
+        return parent.extendedformats.add_out(rec) 
 
 def pack_record(sid, data):
     return struct.pack('<HH',sid,len(data))+data
@@ -489,7 +537,7 @@ class StaticStrings(Record):
         self.strings=strings
         return None
     
-    def getdata(self,ofs):
+    def getdata(self,parent, ofs):
         if not self.strings:
             return ''
         abs_rel_ofs=[]
@@ -517,6 +565,7 @@ class StaticStrings(Record):
                 sst.next_cont()
                 sst.write('\x01' if wide else '\0')
             if runs:
+                runs=[x if i&1==0 else parent.fonts.add_out(parent.fonts[x]) for i,x in enumerate(runs)]
                 cstr=struct.pack('<%dH'%len(runs),*runs)
                 ofs=0
                 while ofs<len(cstr):
@@ -536,9 +585,9 @@ class ColumnInfo(object):
     def read(cls, data):
         return cls(*struct.unpack_from('<6H',data+'\0'*12,4))
 
-    def getdata(self):
+    def getdata(self, parent):
         return pack_short(0x007D,self.firstCol, self.lastCol, 
-            self.colWidth,self.xfIndex, self.options, self.colInfo)
+            self.colWidth,parent.parent.add_extformat(self.xfIndex), self.options, self.colInfo)
 
 class RowInfo(Record):
     def __init__(self, data=None):
@@ -548,11 +597,10 @@ class RowInfo(Record):
         if not data: self.height=20
         self.cells={}
     
-    @property
-    def data(self):
+    def get_data(self, parent):
         return pack_short(0x208,self.row_number, self.firstCol, self.lastCol, 
          self.height, self.optimize, self.reserved, self.options,
-         self.xf_index)
+         parent.parent.add_extformat(self.xf_index))
         
 def get_rkvalue(rk):
     if rk&2==2:
@@ -639,9 +687,9 @@ class CellInfo(Record):
             return str(self.formula)
         return None
     
-    def set_formula(self, formula):
-        self._value=None
+    def set_formula(self, worksheet, formula):
         self.formula=formula
+        self._value=formula.calc(worksheet)
         self.data=None
 
     def getdata(self, worksheet, row, col):
@@ -650,10 +698,16 @@ class CellInfo(Record):
             data=self.data
         elif self.formula:
             self.sid=0x0006
+            if self.data: options=self.data[8:14]
+            else: options='\0'*6
+            if isinstance(self.formula,basestring):
+                formula=self.formula[14:]
+            else:
+                formula=self.formula.getdata()
             if isinstance(self._value,(int,long,float)):
-                data=struct.pack('<d',self._value)+self.formula[8:]
+                data=struct.pack('<d',self._value)
             elif isinstance(self._value,basestring):
-                data=struct.pack('<HiH',0,0,0xffff)+self.formula[8:]
+                data=struct.pack('<HiH',0,0,0xffff)
                 sst=ContinueWriter(0x0207)
                 wide, cstr=StringUtils.writeString0(self._value)
                 sst.write_struct('<H',len(self._value))
@@ -666,13 +720,14 @@ class CellInfo(Record):
                     ofs+=avail
                 more=sst.close()
             elif self._value in (True, False):
-                data=struct.pack('<HiH',1,int(self._value),0xffff)+self.formula[8:]
+                data=struct.pack('<HiH',1,int(self._value),0xffff)
             elif isinstance(self._value,ErrorCode):
-                data=struct.pack('<HiH',2,self._value.errcode,0xffff)+self.formula[8:]
+                data=struct.pack('<HiH',2,self._value.errcode,0xffff)
             elif self._value is None:
-                data=struct.pack('<HiH',3,0,0xffff)+self.formula[8:]
+                data=struct.pack('<HiH',3,0,0xffff)
             else:
-                raise AssertionError
+                raise AssertionError('Unknown Value-Type %s'%type(self._value))
+            data+=options+formula
         elif self._value is None:
             self.sid=0x0201
             data=''
@@ -684,7 +739,7 @@ class CellInfo(Record):
             data=struct.pack('<i',worksheet.add_string(self.get_value(worksheet)))
         else:
             raise AssertionError('%04x:%r'%(self.sid,self._value))
-        return struct.pack('<5H',self.sid,len(data)+6,row,col,self.xf_index)+data+more
+        return struct.pack('<5H',self.sid,len(data)+6,row,col,worksheet.parent.add_extformat(self.xf_index))+data+more
 
 class MulCellInfo(Record):
     @classmethod
